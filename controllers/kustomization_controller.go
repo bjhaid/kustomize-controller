@@ -84,6 +84,8 @@ type KustomizationReconciler struct {
 	MetricsRecorder       *metrics.Recorder
 	StatusPoller          *polling.StatusPoller
 	ControllerName        string
+	SourcePath            string
+	Revision              string
 }
 
 type KustomizationReconcilerOptions struct {
@@ -173,6 +175,7 @@ func (r *KustomizationReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// resolve source reference
 	source, err := r.getSource(ctx, kustomization)
+
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			msg := fmt.Sprintf("Source '%s' not found", kustomization.Spec.SourceRef.String())
@@ -191,7 +194,7 @@ func (r *KustomizationReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	if source.GetArtifact() == nil {
+	if source.GetArtifact() == nil && r.SourcePath != "" {
 		msg := "Source is not ready, artifact not found"
 		kustomization = kustomizev1.KustomizationNotReady(kustomization, "", kustomizev1.ArtifactFailedReason, msg)
 		if err := r.patchStatus(ctx, req, kustomization.Status); err != nil {
@@ -280,30 +283,34 @@ func (r *KustomizationReconciler) reconcile(
 		kustomization.Status.SetLastHandledReconcileRequest(v)
 	}
 
-	revision := source.GetArtifact().Revision
+	tmpDir := r.SourcePath
+	revision := r.Revision
+	if r.SourcePath == "" {
+		revision := source.GetArtifact().Revision
 
-	// create tmp dir
-	tmpDir, err := os.MkdirTemp("", kustomization.Name)
-	if err != nil {
-		err = fmt.Errorf("tmp dir error: %w", err)
-		return kustomizev1.KustomizationNotReady(
-			kustomization,
-			revision,
-			sourcev1.StorageOperationFailedReason,
-			err.Error(),
-		), err
-	}
-	defer os.RemoveAll(tmpDir)
+		// create tmp dir
+		tmpDir, err := os.MkdirTemp("", kustomization.Name)
+		if err != nil {
+			err = fmt.Errorf("tmp dir error: %w", err)
+			return kustomizev1.KustomizationNotReady(
+				kustomization,
+				revision,
+				sourcev1.StorageOperationFailedReason,
+				err.Error(),
+			), err
+		}
+		defer os.RemoveAll(tmpDir)
 
-	// download artifact and extract files
-	err = r.download(source.GetArtifact(), tmpDir)
-	if err != nil {
-		return kustomizev1.KustomizationNotReady(
-			kustomization,
-			revision,
-			kustomizev1.ArtifactFailedReason,
-			err.Error(),
-		), err
+		// download artifact and extract files
+		err = r.download(source.GetArtifact(), tmpDir)
+		if err != nil {
+			return kustomizev1.KustomizationNotReady(
+				kustomization,
+				revision,
+				kustomizev1.ArtifactFailedReason,
+				err.Error(),
+			), err
+		}
 	}
 
 	// check build path exists
@@ -579,6 +586,12 @@ func (r *KustomizationReconciler) getSource(ctx context.Context, kustomization k
 			}
 			return source, fmt.Errorf("unable to get source '%s': %w", namespacedName, err)
 		}
+		if r.SourcePath != "" {
+			a := &sourcev1.Artifact{}
+			a.Path = r.SourcePath
+			a.Revision = r.Revision
+			repository.Status.Artifact = a
+		}
 		source = &repository
 	case sourcev1.BucketKind:
 		var bucket sourcev1.Bucket
@@ -589,11 +602,18 @@ func (r *KustomizationReconciler) getSource(ctx context.Context, kustomization k
 			}
 			return source, fmt.Errorf("unable to get source '%s': %w", namespacedName, err)
 		}
+		if r.SourcePath != "" {
+			a := &sourcev1.Artifact{}
+			a.Path = r.SourcePath
+			a.Revision = r.Revision
+			bucket.Status.Artifact = a
+		}
 		source = &bucket
 	default:
 		return source, fmt.Errorf("source `%s` kind '%s' not supported",
 			kustomization.Spec.SourceRef.Name, kustomization.Spec.SourceRef.Kind)
 	}
+
 	return source, nil
 }
 
@@ -721,11 +741,13 @@ func (r *KustomizationReconciler) apply(ctx context.Context, manager *ssa.Resour
 			}
 		}
 
-		if err := manager.Wait(stageOne, ssa.WaitOptions{
-			Interval: 2 * time.Second,
-			Timeout:  kustomization.GetTimeout(),
-		}); err != nil {
-			return false, nil, err
+		if r.SourcePath == "" {
+			if err := manager.Wait(stageOne, ssa.WaitOptions{
+				Interval: 2 * time.Second,
+				Timeout:  kustomization.GetTimeout(),
+			}); err != nil {
+				return false, nil, err
+			}
 		}
 	}
 
